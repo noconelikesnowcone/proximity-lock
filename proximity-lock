@@ -1,0 +1,1354 @@
+#!/usr/bin/env python3
+"""Lock the screen when a chosen phone or watch leaves Bluetooth range.
+
+The screen locks only after the chosen device has been seen nearby and then
+stays silent. A Bluetooth outage disarms the watcher instead of locking.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+import dbus
+import dbus.service
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
+
+DBusGMainLoop(set_as_default=True)
+
+CONFIG_DIR = Path.home() / ".config" / "proximity-lock"
+CONFIG_PATH = CONFIG_DIR / "config.json"
+STATE_PATH = CONFIG_DIR / "state.json"
+PAUSE_PATH = CONFIG_DIR / "paused"
+SERVICE_NAME = "proximity-lock.service"
+SERVICE_PATH = Path.home() / ".config" / "systemd" / "user" / SERVICE_NAME
+AGENT_PATH = "/org/proximitylock/agent"
+AGENT_IFACE = "org.bluez.Agent1"
+BLUEZ = "org.bluez"
+DEVICE_IFACE = "org.bluez.Device1"
+ADAPTER_IFACE = "org.bluez.Adapter1"
+OM = "org.freedesktop.DBus.ObjectManager"
+PROPS = "org.freedesktop.DBus.Properties"
+APPLE = 0x004C
+MAC_RE = re.compile(r"^([0-9A-F]{2}:){5}[0-9A-F]{2}$")
+
+KIND_NAMES = {
+    0x05: "AirDrop",
+    0x07: "AirPods",
+    0x09: "AirPlay",
+    0x0A: "AirPlay",
+    0x0B: "Apple Watch",
+    0x0C: "Handoff",
+    0x0F: "Nearby",
+    0x10: "Apple",
+    0x12: "Find My",
+}
+
+SERVICE_UNIT = """\
+[Unit]
+Description=Lock the screen when a Bluetooth device leaves range
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/proximity-lock run
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target
+"""
+
+
+def log(message: str) -> None:
+    print(f"proximity-lock: {message}", flush=True)
+
+
+def notify(summary: str, body: str, urgency: str = "normal") -> None:
+    subprocess.run(
+        ["notify-send", "-a", "Proximity lock", "-u", urgency, summary, body],
+        check=False,
+    )
+
+
+def load_config() -> dict | None:
+    try:
+        data = json.loads(CONFIG_PATH.read_text())
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as exc:
+        log(f"could not read {CONFIG_PATH}: {exc}")
+        return None
+    address = str(data.get("address", "")).upper()
+    name = str(data.get("name", "")).strip()
+    if not MAC_RE.match(address):
+        log(f"config address is not a Bluetooth address: {address!r}")
+        return None
+    away = data.get("away_seconds", 20)
+    warn = data.get("warn_seconds", 6)
+    try:
+        away = int(away)
+        warn = int(warn)
+    except (TypeError, ValueError):
+        away, warn = 20, 6
+    return {
+        "address": address,
+        "name": name or address,
+        "away_seconds": min(300, max(10, away)),
+        "warn_seconds": min(60, max(0, warn)),
+    }
+
+
+def save_config(config: dict) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(config, indent=2) + "\n")
+    tmp.replace(CONFIG_PATH)
+
+
+def write_state(payload: dict) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    payload = dict(payload)
+    payload["updated"] = time.time()
+    tmp = STATE_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload) + "\n")
+    tmp.replace(STATE_PATH)
+
+
+def read_state() -> dict | None:
+    try:
+        return json.loads(STATE_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def pause_until() -> float | None:
+    """Return a wall-clock expiry, inf while paused, or None when not paused."""
+    try:
+        text = PAUSE_PATH.read_text().strip()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+    if not text or text == "forever":
+        return float("inf")
+    try:
+        expiry = float(text)
+    except ValueError:
+        return float("inf")
+    if time.time() >= expiry:
+        PAUSE_PATH.unlink(missing_ok=True)
+        return None
+    return expiry
+
+
+def apple_kinds(manufacturer: object) -> list[str]:
+    raw = None
+    if isinstance(manufacturer, dict):
+        for key, value in manufacturer.items():
+            if int(key) == APPLE:
+                raw = value
+                break
+    if raw is None:
+        return []
+    data = bytes(int(byte) for byte in raw)
+    kinds: list[str] = []
+    index = 0
+    while index + 1 < len(data):
+        kind = data[index]
+        length = data[index + 1]
+        label = KIND_NAMES.get(kind)
+        if label and label not in kinds:
+            kinds.append(label)
+        if length < 0:
+            break
+        index += 2 + length
+        if index > len(data) + 8:
+            break
+    if not kinds:
+        kinds.append("Apple")
+    return kinds
+
+
+def real_name(props: dict) -> str:
+    name = str(props.get("Name") or "").strip()
+    if name:
+        return name
+    alias = str(props.get("Alias") or "").strip()
+    address = str(props.get("Address") or "")
+    dashed = address.replace(":", "-")
+    if alias and alias not in {address, dashed}:
+        return alias
+    return ""
+
+
+def kind_label(name: str, kinds: list[str]) -> str:
+    lowered = name.lower()
+    if "watch" in lowered:
+        return "Apple Watch"
+    if "iphone" in lowered:
+        return "iPhone"
+    if "ipad" in lowered:
+        return "iPad"
+    for preferred in ("Apple Watch", "AirPods", "Handoff", "Apple", "Nearby", "AirPlay", "Find My"):
+        if preferred in kinds:
+            return preferred
+    return kinds[0] if kinds else "Bluetooth"
+
+
+def distance_word(rssi: int | None) -> str:
+    if rssi is None:
+        return "in range"
+    if rssi >= -50:
+        return "very close"
+    if rssi >= -65:
+        return "close"
+    if rssi >= -78:
+        return "nearby"
+    return "far"
+
+
+def looks_like_phone_or_watch(name: str) -> bool:
+    lowered = name.lower()
+    return any(word in lowered for word in ("iphone", "watch", "ipad"))
+
+
+def rank_device(device: dict) -> tuple:
+    name = device.get("name") or ""
+    rssi = device.get("rssi")
+    return (
+        0 if looks_like_phone_or_watch(name) else 1,
+        0 if name else 1,
+        -(rssi if isinstance(rssi, int) else -999),
+    )
+
+
+def include_in_picker(device: dict) -> bool:
+    if device.get("name"):
+        return True
+    rssi = device.get("rssi")
+    if not isinstance(rssi, int) or rssi < -68:
+        return False
+    kinds = set(device.get("kinds") or [])
+    if not kinds:
+        return rssi >= -55
+    boring = {"Find My", "AirPods", "AirPlay", "AirDrop"}
+    if kinds <= boring:
+        return False
+    return True
+
+
+class Guard:
+    """Presence state. Lock only on a present → away transition while healthy."""
+
+    def __init__(self, away_seconds: int, warn_seconds: int):
+        self.away_seconds = away_seconds
+        self.warn_seconds = warn_seconds
+        self.last_seen: float | None = None
+        self.armed = False
+        self.phase = "searching"
+        self.warn_at: float | None = None
+        self.paused = False
+        self.healthy = True
+
+    def see(self, now: float) -> str | None:
+        if self.paused:
+            return None
+        first = not self.armed
+        previous = self.phase
+        self.last_seen = now
+        self.armed = True
+        self.phase = "present"
+        self.warn_at = None
+        if first or previous == "searching":
+            return "arm"
+        if previous == "warning":
+            return "cancel"
+        if previous == "away":
+            return "rearm"
+        return None
+
+    def tick(self, now: float) -> str | None:
+        if self.paused or not self.healthy:
+            return None
+        if self.phase not in {"present", "warning"}:
+            return None
+        if not self.armed or self.last_seen is None:
+            return None
+        age = now - self.last_seen
+        if self.phase == "present":
+            if age < self.away_seconds:
+                return None
+            if self.warn_seconds <= 0:
+                self.phase = "away"
+                return "lock"
+            self.phase = "warning"
+            self.warn_at = now
+            return "warn"
+        if age < self.away_seconds:
+            self.phase = "present"
+            self.warn_at = None
+            return "cancel"
+        if self.warn_at is not None and now - self.warn_at >= self.warn_seconds:
+            self.phase = "away"
+            return "lock"
+        return None
+
+    def pause(self) -> None:
+        self.paused = True
+        self.phase = "paused"
+        self.warn_at = None
+
+    def resume(self) -> None:
+        # Require a fresh sighting so a stale timestamp cannot lock on resume.
+        self.paused = False
+        self.armed = False
+        self.last_seen = None
+        self.warn_at = None
+        self.phase = "searching"
+
+    def mark_unhealthy(self) -> None:
+        if not self.healthy:
+            return
+        self.healthy = False
+        self.armed = False
+        self.last_seen = None
+        self.warn_at = None
+        self.phase = "searching"
+
+    def mark_healthy(self) -> None:
+        self.healthy = True
+
+
+def self_test() -> int:
+    guard = Guard(20, 6)
+    assert guard.tick(0) is None
+    assert guard.see(0) == "arm"
+    assert guard.tick(19) is None
+    assert guard.tick(20) == "warn"
+    assert guard.see(21) == "cancel"
+    assert guard.tick(40) is None
+    assert guard.tick(41) == "warn"
+    assert guard.tick(46) is None
+    assert guard.tick(47) == "lock"
+    assert guard.tick(80) is None
+    assert guard.see(81) == "rearm"
+    assert guard.tick(200) == "warn"
+
+    held = Guard(20, 0)
+    held.see(0)
+    held.pause()
+    assert held.tick(100) is None
+    assert held.see(101) is None
+    held.resume()
+    assert held.tick(130) is None
+    assert held.see(131) == "arm"
+
+    blind = Guard(20, 6)
+    blind.see(0)
+    blind.mark_unhealthy()
+    assert blind.tick(100) is None
+    assert blind.phase == "searching"
+    print("proximity-lock: self-test ok")
+    return 0
+
+
+def system_bus() -> dbus.SystemBus:
+    return dbus.SystemBus()
+
+
+def managed_objects(bus: dbus.SystemBus) -> dict:
+    manager = dbus.Interface(bus.get_object(BLUEZ, "/"), OM)
+    return manager.GetManagedObjects()
+
+
+def find_adapter(bus: dbus.SystemBus) -> str | None:
+    try:
+        objects = managed_objects(bus)
+    except dbus.exceptions.DBusException:
+        return None
+    for path, interfaces in objects.items():
+        if ADAPTER_IFACE in interfaces:
+            return str(path)
+    return None
+
+
+def adapter_alias(bus: dbus.SystemBus, adapter: str) -> str:
+    props = dbus.Interface(bus.get_object(BLUEZ, adapter), PROPS)
+    try:
+        return str(props.Get(ADAPTER_IFACE, "Alias"))
+    except dbus.exceptions.DBusException:
+        return "this computer"
+
+
+def ensure_power(bus: dbus.SystemBus, adapter: str) -> bool:
+    props = dbus.Interface(bus.get_object(BLUEZ, adapter), PROPS)
+    try:
+        powered = bool(props.Get(ADAPTER_IFACE, "Powered"))
+    except dbus.exceptions.DBusException:
+        powered = False
+    if powered:
+        return True
+    subprocess.run(["omarchy", "bluetooth", "power", "on"], check=False)
+    try:
+        props.Set(ADAPTER_IFACE, "Powered", dbus.Boolean(True))
+    except dbus.exceptions.DBusException as exc:
+        log(f"could not turn Bluetooth on: {exc}")
+        return False
+    return True
+
+
+def device_path(adapter: str, address: str) -> str:
+    return adapter + "/dev_" + address.upper().replace(":", "_")
+
+
+def props_of(bus: dbus.SystemBus, path: str) -> dict | None:
+    try:
+        props = dbus.Interface(bus.get_object(BLUEZ, path), PROPS)
+        return props.GetAll(DEVICE_IFACE)
+    except dbus.exceptions.DBusException:
+        return None
+
+
+def record_from_props(props: dict) -> dict | None:
+    if "Address" not in props:
+        return None
+    rssi = props.get("RSSI")
+    rssi_value = int(rssi) if rssi is not None and int(rssi) < 0 else None
+    if rssi_value is None:
+        return None
+    kinds = apple_kinds(props.get("ManufacturerData") or {})
+    return {
+        "address": str(props["Address"]).upper(),
+        "name": real_name(props),
+        "rssi": rssi_value,
+        "kinds": kinds,
+        "paired": bool(props.get("Paired")),
+        "path": "",
+    }
+
+
+def discovery_filter() -> dict:
+    return {
+        "Transport": dbus.String("le"),
+        "DuplicateData": dbus.Boolean(True),
+    }
+
+
+def start_discovery(bus: dbus.SystemBus, adapter: str) -> bool:
+    iface = dbus.Interface(bus.get_object(BLUEZ, adapter), ADAPTER_IFACE)
+    try:
+        iface.SetDiscoveryFilter(discovery_filter())
+    except dbus.exceptions.DBusException as exc:
+        if "InProgress" not in str(exc) and "Failed" not in str(exc):
+            log(f"discovery filter: {exc}")
+    try:
+        iface.StartDiscovery()
+    except dbus.exceptions.DBusException as exc:
+        if "InProgress" not in str(exc):
+            log(f"discovery start: {exc}")
+            return False
+    return True
+
+
+def stop_discovery(bus: dbus.SystemBus, adapter: str) -> None:
+    iface = dbus.Interface(bus.get_object(BLUEZ, adapter), ADAPTER_IFACE)
+    try:
+        iface.StopDiscovery()
+    except dbus.exceptions.DBusException:
+        pass
+
+
+def menu(prompt: str, rows: list[tuple[str, str]], width: int = 440) -> str | None:
+    # The menu reads "<glyph>\\t<label>\\t<detail>". A row with one tab is
+    # drawn as an icon, which turns a sentence into a garbled glyph.
+    args = ["omarchy-menu-select", prompt]
+    for label, subtext in rows:
+        if subtext:
+            args.append(f"\t{label}\t{subtext}")
+        else:
+            args.append(label)
+    args += ["--", "--width", str(width), "--maxheight", "520"]
+    completed = subprocess.run(args, text=True, capture_output=True, check=False)
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()
+        log(f"device menu closed ({completed.returncode}) {detail}".rstrip())
+        return None
+    return completed.stdout.strip()
+
+
+def parse_menu_choice(raw: str | None) -> tuple[str, str] | None:
+    if not raw:
+        return None
+    if "\t" in raw:
+        label, subtext = raw.split("\t", 1)
+        return label.strip(), subtext.strip()
+    return raw.strip(), ""
+
+
+def device_row(device: dict) -> tuple[str, str]:
+    name = device.get("name") or ""
+    kind = kind_label(name, device.get("kinds") or [])
+    rssi = device.get("rssi")
+    rssi_text = f"{rssi} dBm" if isinstance(rssi, int) else "in range"
+    label = name or f"Unnamed {kind}"
+    return label, f"{distance_word(rssi)}, {rssi_text}, {device['address']}"
+
+
+def picker_rows(devices: list[dict]) -> list[tuple[str, str]]:
+    chosen = [device for device in devices if include_in_picker(device)]
+    chosen.sort(key=lambda device: -(device.get("rssi") if isinstance(device.get("rssi"), int) else -999))
+    rows: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    if len(chosen) >= 2 and isinstance(chosen[0].get("rssi"), int) and isinstance(chosen[1].get("rssi"), int):
+        gap = chosen[0]["rssi"] - chosen[1]["rssi"]
+        if gap >= 8:
+            rssi = chosen[0]["rssi"]
+            rows.append(("Against the computer", f"{rssi} dBm, {chosen[0]['address']}"))
+            seen.add(chosen[0]["address"])
+    named = [device for device in chosen if device.get("name")]
+    unnamed = [device for device in chosen if not device.get("name")]
+    for device in named + unnamed[:4]:
+        if device["address"] in seen:
+            continue
+        rows.append(device_row(device))
+        seen.add(device["address"])
+    rows.append(("Scan again", "Hold the phone or watch against the computer"))
+    rows.append(("Cancel", ""))
+    return rows
+
+
+def scan_and_ask(bus: dbus.SystemBus, adapter: str) -> tuple[str, str] | None:
+    by_path: dict[str, dict] = {}
+
+    def fetch(path: str) -> dict | None:
+        props = props_of(bus, path)
+        if not props:
+            return None
+        record = record_from_props(props)
+        if not record:
+            return None
+        record["path"] = path
+        return record
+
+    def on_properties(interface: str, changed: dict, _invalidated, path: str) -> None:
+        if interface != DEVICE_IFACE or not str(path).startswith(adapter + "/"):
+            return
+        record = by_path.get(path)
+        if record is None:
+            record = fetch(path)
+            if record:
+                by_path[path] = record
+            return
+        if "RSSI" in changed:
+            rssi = int(changed["RSSI"])
+            if rssi < 0:
+                record["rssi"] = rssi
+        if "Name" in changed or "Alias" in changed:
+            props = props_of(bus, path)
+            if props:
+                record["name"] = real_name(props)
+        if "ManufacturerData" in changed:
+            record["kinds"] = apple_kinds(changed["ManufacturerData"])
+        if "Paired" in changed:
+            record["paired"] = bool(changed["Paired"])
+
+    def on_added(path: str, interfaces: dict) -> None:
+        if DEVICE_IFACE in interfaces and str(path).startswith(adapter + "/"):
+            record = fetch(str(path))
+            if record:
+                by_path[str(path)] = record
+
+    bus.add_signal_receiver(
+        on_properties,
+        signal_name="PropertiesChanged",
+        dbus_interface=PROPS,
+        bus_name=BLUEZ,
+        path_keyword="path",
+    )
+    bus.add_signal_receiver(
+        on_added,
+        signal_name="InterfacesAdded",
+        dbus_interface=OM,
+        bus_name=BLUEZ,
+    )
+    start_discovery(bus, adapter)
+    started = time.monotonic()
+    decision: dict[str, tuple[str, str] | None] = {}
+    loop = GLib.MainLoop()
+
+    def open_menu() -> None:
+        try:
+            objects = managed_objects(bus)
+        except dbus.exceptions.DBusException:
+            objects = {}
+        for path, interfaces in objects.items():
+            props = interfaces.get(DEVICE_IFACE)
+            if not props or not str(path).startswith(adapter + "/"):
+                continue
+            record = record_from_props(props)
+            if not record:
+                continue
+            record["path"] = str(path)
+            by_path[str(path)] = record
+        devices = list(by_path.values())
+        named = [device["name"] for device in devices if device.get("name")]
+        log(f"picker saw {len(devices)} devices, {len(named)} named")
+        for device in sorted(devices, key=rank_device)[:12]:
+            label = device["name"] or "(unnamed)"
+            log(f"  {device['rssi']} dBm  {label}  {device['address']}  {', '.join(device['kinds'])}")
+
+        def ask() -> None:
+            raw = menu(
+                "Hold the phone or watch against this computer, then choose it",
+                picker_rows(devices),
+                width=640,
+            )
+            parsed = parse_menu_choice(raw)
+            if parsed is None:
+                decision["choice"] = ("Cancel", "cancel")
+            else:
+                decision["choice"] = parsed
+            GLib.idle_add(loop.quit)
+
+        threading.Thread(target=ask, daemon=True).start()
+
+    def maybe_open() -> bool:
+        elapsed = time.monotonic() - started
+        named_target = any(
+            looks_like_phone_or_watch(device.get("name") or "") for device in by_path.values()
+        )
+        if named_target and elapsed >= 8:
+            open_menu()
+            return False
+        if elapsed >= 22:
+            open_menu()
+            return False
+        return True
+
+    GLib.timeout_add_seconds(1, maybe_open)
+    try:
+        loop.run()
+    finally:
+        bus.remove_signal_receiver(
+            on_properties,
+            signal_name="PropertiesChanged",
+            dbus_interface=PROPS,
+            bus_name=BLUEZ,
+        )
+        bus.remove_signal_receiver(
+            on_added,
+            signal_name="InterfacesAdded",
+            dbus_interface=OM,
+            bus_name=BLUEZ,
+        )
+    choice = decision.get("choice")
+    if choice is None:
+        return ("Cancel", "cancel")
+    return choice
+
+
+class Rejected(dbus.DBusException):
+    _dbus_error_name = "org.bluez.Error.Rejected"
+
+
+class PairAgent(dbus.service.Object):
+    def __init__(self, bus: dbus.Bus, device_name: str):
+        super().__init__(bus, AGENT_PATH)
+        self.device_name = device_name
+
+    def _ask(self, prompt: str, yes: str, reply, error) -> None:
+        def work() -> None:
+            raw = menu(prompt, [(yes, ""), ("Cancel", "")], width=420)
+            parsed = parse_menu_choice(raw)
+
+            def finish() -> bool:
+                if parsed and parsed[0] == yes:
+                    reply()
+                else:
+                    error(Rejected("pairing cancelled"))
+                return False
+
+            GLib.idle_add(finish)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    @dbus.service.method(AGENT_IFACE, in_signature="o", out_signature="s")
+    def RequestPinCode(self, _device: str) -> str:
+        return "0000"
+
+    @dbus.service.method(AGENT_IFACE, in_signature="o", out_signature="u")
+    def RequestPasskey(self, _device: str) -> dbus.UInt32:
+        return dbus.UInt32(0)
+
+    @dbus.service.method(AGENT_IFACE, in_signature="ou", out_signature="", async_callbacks=("reply", "error"))
+    def RequestConfirmation(self, _device: str, passkey: int, reply, error) -> None:
+        code = f"{int(passkey):06d}"
+        notify("Confirm the pairing code", f"{code} should match the code on {self.device_name}.", "critical")
+        self._ask(f"Pairing code {code}", f"Yes, {code} matches", reply, error)
+
+    @dbus.service.method(AGENT_IFACE, in_signature="o", out_signature="", async_callbacks=("reply", "error"))
+    def RequestAuthorization(self, _device: str, reply, error) -> None:
+        self._ask(f"Pair with {self.device_name}?", "Pair", reply, error)
+
+    @dbus.service.method(AGENT_IFACE, in_signature="os", out_signature="", async_callbacks=("reply", "error"))
+    def AuthorizeService(self, _device: str, _uuid: str, reply, error) -> None:
+        reply()
+
+    @dbus.service.method(AGENT_IFACE, in_signature="", out_signature="")
+    def Cancel(self) -> None:
+        log("pairing cancelled by the device")
+
+    @dbus.service.method(AGENT_IFACE, in_signature="", out_signature="")
+    def Release(self) -> None:
+        log("pairing agent released")
+
+
+def register_agent(bus: dbus.SystemBus, agent: PairAgent) -> None:
+    manager = dbus.Interface(bus.get_object(BLUEZ, "/org/bluez"), "org.bluez.AgentManager1")
+    try:
+        manager.UnregisterAgent(AGENT_PATH)
+    except dbus.exceptions.DBusException:
+        pass
+    manager.RegisterAgent(AGENT_PATH, "DisplayYesNo")
+    manager.RequestDefaultAgent(AGENT_PATH)
+
+
+def unregister_agent(bus: dbus.SystemBus) -> None:
+    manager = dbus.Interface(bus.get_object(BLUEZ, "/org/bluez"), "org.bluez.AgentManager1")
+    try:
+        manager.UnregisterAgent(AGENT_PATH)
+    except dbus.exceptions.DBusException:
+        pass
+    subprocess.run(["systemctl", "--user", "restart", "bt-agent.service"], check=False)
+
+
+def paired_devices(bus: dbus.SystemBus) -> list[dict]:
+    try:
+        objects = managed_objects(bus)
+    except dbus.exceptions.DBusException:
+        return []
+    found = []
+    for path, interfaces in objects.items():
+        props = interfaces.get(DEVICE_IFACE)
+        if not props or not bool(props.get("Paired")):
+            continue
+        found_name = real_name(props) or str(props.get("Alias") or "")
+        found.append(
+            {
+                "address": str(props.get("Address", "")).upper(),
+                "name": found_name,
+                "path": str(path),
+            }
+        )
+    return found
+
+
+def find_identity(bus: dbus.SystemBus, address: str, name: str, before: set[str] | None = None) -> dict | None:
+    address = address.upper()
+    devices = paired_devices(bus)
+    fallback = None
+    fresh = []
+    for device in devices:
+        if device["address"] == address:
+            return device
+        if name and device["name"] == name:
+            fallback = device
+        if before is not None and device["address"] not in before:
+            fresh.append(device)
+    if fallback:
+        return fallback
+    if len(fresh) == 1:
+        device = fresh[0]
+        if not device["name"]:
+            device["name"] = name or device["address"]
+        return device
+    return None
+
+
+def pair_device(bus: dbus.SystemBus, adapter: str, address: str, name: str) -> dict | None:
+    computer = adapter_alias(bus, adapter)
+    display = name or address
+    stop_discovery(bus, adapter)
+    agent = PairAgent(bus, display)
+    register_agent(bus, agent)
+    props_iface = dbus.Interface(bus.get_object(BLUEZ, adapter), PROPS)
+    already = {device["address"] for device in paired_devices(bus)}
+    try:
+        path = device_path(adapter, address)
+        device = dbus.Interface(bus.get_object(BLUEZ, path), DEVICE_IFACE)
+        outcome: dict[str, object] = {}
+        loop = GLib.MainLoop()
+
+        def ok() -> None:
+            outcome["ok"] = True
+            loop.quit()
+
+        def err(exc: dbus.DBusException) -> None:
+            outcome["error"] = exc
+            loop.quit()
+
+        notify(
+            f"Pair {display}",
+            f"Accept the prompt on the device. If it lists this computer, tap {computer}.",
+        )
+        pair_timeout = None
+        try:
+            device.Pair(reply_handler=ok, error_handler=err, timeout=70)
+        except dbus.exceptions.DBusException as exc:
+            outcome["error"] = exc
+        else:
+            def pair_timed_out() -> bool:
+                outcome["timeout"] = True
+                loop.quit()
+                return False
+
+            pair_timeout = GLib.timeout_add_seconds(75, pair_timed_out)
+            loop.run()
+            if pair_timeout is not None and not outcome.get("timeout"):
+                GLib.source_remove(pair_timeout)
+
+        identity = find_identity(bus, address, name, already)
+        if identity:
+            trust(bus, identity["path"])
+            return identity
+
+        error = outcome.get("error")
+        if error:
+            log(f"direct pair did not finish: {error}")
+        log("waiting for the device to pair from its Bluetooth settings")
+        try:
+            props_iface.Set(ADAPTER_IFACE, "DiscoverableTimeout", dbus.UInt32(90))
+            props_iface.Set(ADAPTER_IFACE, "Discoverable", dbus.Boolean(True))
+        except dbus.exceptions.DBusException as exc:
+            log(f"could not make {computer} discoverable: {exc}")
+        notify(
+            f"Tap {computer}",
+            f"On {display}, open Bluetooth settings and tap {computer}. Confirm the code if one appears.",
+            "critical",
+        )
+        identity = wait_until_paired(bus, address, name, 90, already)
+        if identity:
+            trust(bus, identity["path"])
+            return identity
+        notify("Pairing did not finish", f"{display} is not paired. Open its Bluetooth settings and run proximity-lock pick again.")
+        return None
+    finally:
+        try:
+            props_iface.Set(ADAPTER_IFACE, "Discoverable", dbus.Boolean(False))
+        except dbus.exceptions.DBusException:
+            pass
+        unregister_agent(bus)
+
+
+def trust(bus: dbus.SystemBus, path: str) -> None:
+    props = dbus.Interface(bus.get_object(BLUEZ, path), PROPS)
+    try:
+        props.Set(DEVICE_IFACE, "Trusted", dbus.Boolean(True))
+    except dbus.exceptions.DBusException as exc:
+        log(f"could not trust device: {exc}")
+
+
+def wait_until_paired(
+    bus: dbus.SystemBus, address: str, name: str, seconds: int, before: set[str]
+) -> dict | None:
+    found: dict[str, dict] = {}
+    loop = GLib.MainLoop()
+    deadline = time.monotonic() + seconds
+
+    def check() -> bool:
+        identity = find_identity(bus, address, name, before)
+        if identity:
+            found["identity"] = identity
+            loop.quit()
+            return False
+        if time.monotonic() >= deadline:
+            loop.quit()
+            return False
+        return True
+
+    GLib.timeout_add_seconds(1, check)
+    loop.run()
+    return found.get("identity")
+
+
+def install_service() -> None:
+    SERVICE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if not SERVICE_PATH.exists() or SERVICE_PATH.read_text() != SERVICE_UNIT:
+        SERVICE_PATH.write_text(SERVICE_UNIT)
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+
+
+def service_active() -> bool:
+    completed = subprocess.run(
+        ["systemctl", "--user", "is-active", "--quiet", SERVICE_NAME],
+        check=False,
+    )
+    return completed.returncode == 0
+
+
+def start_service() -> None:
+    install_service()
+    subprocess.run(["systemctl", "--user", "enable", "--now", SERVICE_NAME], check=False)
+    subprocess.run(["systemctl", "--user", "restart", SERVICE_NAME], check=False)
+
+
+def stop_service() -> None:
+    subprocess.run(["systemctl", "--user", "disable", "--now", SERVICE_NAME], check=False)
+
+
+def screen_locked() -> bool:
+    completed = subprocess.run(["omarchy-hyprland-session-locked"], check=False)
+    return completed.returncode == 0
+
+
+def lock_screen() -> None:
+    if screen_locked():
+        log("screen is already locked")
+        return
+    completed = subprocess.run(["omarchy", "system", "lock"], check=False)
+    if completed.returncode != 0:
+        log(f"omarchy system lock exited {completed.returncode}")
+        subprocess.run(["loginctl", "lock-session"], check=False)
+
+
+def cmd_pick() -> int:
+    was_active = service_active()
+    if was_active:
+        subprocess.run(["systemctl", "--user", "stop", SERVICE_NAME], check=False)
+    bus = system_bus()
+    try:
+        adapter = find_adapter(bus)
+        if adapter is None or not ensure_power(bus, adapter):
+            notify("Bluetooth is off", "Turn Bluetooth on, then run proximity-lock pick again.")
+            return 1
+        notify(
+            "Hold it against this computer",
+            "Put the iPhone or Apple Watch on the computer. On the iPhone, leave Settings → Bluetooth open. Then choose the strongest signal.",
+        )
+        log("waiting for the device to be held against the computer")
+        time.sleep(6)
+        while True:
+            choice = scan_and_ask(bus, adapter)
+            if choice is None:
+                return 1
+            label, subtext = choice
+            if label in {"", "Cancel"}:
+                log("picker cancelled")
+                return 1
+            if label == "Scan again":
+                notify("Scanning again", "Hold the phone or watch against the computer.")
+                continue
+            found = re.search(r"(?:[0-9A-F]{2}:){5}[0-9A-F]{2}", subtext.upper())
+            if not found:
+                log(f"unexpected menu result: {choice}")
+                return 1
+            address = found.group(0)
+            name = "" if label.startswith("Unnamed") or label == "Against the computer" else label
+            identity = pair_device(bus, adapter, address, name)
+            if not identity:
+                return 1
+            config = {
+                "address": identity["address"],
+                "name": identity["name"],
+                "away_seconds": 20,
+                "warn_seconds": 6,
+            }
+            save_config(config)
+            start_service()
+            notify(
+                f"Watching {config['name']}",
+                "The screen locks when this device leaves Bluetooth range. It will not lock until the device has been seen nearby.",
+            )
+            log(f"watching {config['name']} at {config['address']}")
+            return 0
+    finally:
+        adapter = find_adapter(bus)
+        if adapter:
+            stop_discovery(bus, adapter)
+        if was_active and load_config() and not service_active():
+            subprocess.run(["systemctl", "--user", "start", SERVICE_NAME], check=False)
+
+
+def cmd_scan() -> int:
+    bus = system_bus()
+    adapter = find_adapter(bus)
+    if adapter is None or not ensure_power(bus, adapter):
+        log("Bluetooth adapter is not available")
+        return 1
+    try:
+        start_discovery(bus, adapter)
+        loop = GLib.MainLoop()
+        GLib.timeout_add_seconds(8, lambda: loop.quit() or False)
+        loop.run()
+        objects = managed_objects(bus)
+    finally:
+        stop_discovery(bus, adapter)
+    rows = []
+    for path, interfaces in objects.items():
+        props = interfaces.get(DEVICE_IFACE)
+        if not props or not str(path).startswith(adapter + "/"):
+            continue
+        record = record_from_props(props)
+        if record:
+            rows.append(record)
+    rows.sort(key=rank_device)
+    for device in rows:
+        name = device["name"] or "(unnamed)"
+        kinds = ", ".join(device["kinds"])
+        print(f"{device['rssi']:4d} dBm  {name}  {device['address']}  {kinds}")
+    return 0
+
+
+def cmd_status() -> int:
+    config = load_config()
+    if config is None:
+        print("No device selected. Run: proximity-lock pick")
+        return 1
+    active = service_active()
+    state = read_state() or {}
+    paused = pause_until()
+    print(f"Device: {config['name']} ({config['address']})")
+    print(f"Service: {'running' if active else 'stopped'}")
+    if paused is not None:
+        if paused == float("inf"):
+            print("Paused: until you run proximity-lock resume")
+        else:
+            minutes = max(0, int((paused - time.time()) / 60))
+            print(f"Paused: about {minutes} minutes left")
+    phase = state.get("phase", "unknown" if active else "stopped")
+    age = state.get("last_seen_age")
+    updated = state.get("updated")
+    if isinstance(age, (int, float)) and isinstance(updated, (int, float)):
+        age = int(age + max(0, time.time() - float(updated)))
+    rssi = state.get("rssi")
+    detail = phase
+    if isinstance(age, int) and phase == "present":
+        detail = f"present, last seen {age}s ago"
+    if isinstance(rssi, int):
+        detail += f", {rssi} dBm"
+    print(f"State: {detail}")
+    print(
+        f"Locks after {config['away_seconds']}s out of range, "
+        f"then a {config['warn_seconds']}s warning."
+    )
+    return 0
+
+
+def cmd_pause(minutes: int | None) -> int:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    if minutes is None:
+        PAUSE_PATH.write_text("forever\n")
+        print("Paused until you run proximity-lock resume.")
+    else:
+        PAUSE_PATH.write_text(str(time.time() + minutes * 60) + "\n")
+        print(f"Paused for {minutes} minutes.")
+    return 0
+
+
+def cmd_resume() -> int:
+    PAUSE_PATH.unlink(missing_ok=True)
+    print("Resumed. The screen will not lock until the device is seen nearby again.")
+    return 0
+
+
+def cmd_on() -> int:
+    if load_config() is None:
+        print("No device selected. Run: proximity-lock pick")
+        return 1
+    start_service()
+    print("Proximity lock is on.")
+    return 0
+
+
+def cmd_off() -> int:
+    stop_service()
+    print("Proximity lock is off. The device stays paired.")
+    return 0
+
+
+def cmd_forget() -> int:
+    config = load_config()
+    stop_service()
+    PAUSE_PATH.unlink(missing_ok=True)
+    STATE_PATH.unlink(missing_ok=True)
+    if config:
+        subprocess.run(
+            ["bluetoothctl", "remove", config["address"]],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        CONFIG_PATH.unlink(missing_ok=True)
+        print(f"Forgot {config['name']}.")
+    else:
+        print("Nothing was selected.")
+    return 0
+
+
+class Watcher:
+    def __init__(self, bus: dbus.SystemBus, adapter: str, config: dict):
+        self.bus = bus
+        self.adapter = adapter
+        self.config = config
+        self.guard = Guard(config["away_seconds"], config["warn_seconds"])
+        self.rssi: int | None = None
+        self.last_bounce = 0.0
+        self.last_state_write = 0.0
+        self.unhealthy_notified = False
+        self.search_notified = False
+        self.started = time.monotonic()
+        self.target_path = device_path(adapter, config["address"])
+        self.loop = GLib.MainLoop()
+        self.discovering = False
+        self.powered = True
+
+    def on_properties(self, interface: str, changed: dict, _invalidated, path: str) -> None:
+        if interface == ADAPTER_IFACE and path == self.adapter:
+            if "Discovering" in changed:
+                self.discovering = bool(changed["Discovering"])
+            if "Powered" in changed:
+                self.powered = bool(changed["Powered"])
+                if not self.powered:
+                    self.guard.mark_unhealthy()
+            return
+        if path != self.target_path:
+            return
+        sighting = False
+        if "RSSI" in changed:
+            rssi = int(changed["RSSI"])
+            if -127 <= rssi < 0:
+                self.rssi = rssi
+                sighting = True
+        if any(key in changed for key in ("ManufacturerData", "ServiceData", "Name", "UUIDs")):
+            sighting = True
+        if not sighting:
+            return
+        event = self.guard.see(time.monotonic())
+        self.publish(force=event is not None)
+        if event == "arm":
+            log(f"watching {self.config['name']}")
+            notify(
+                f"Watching {self.config['name']}",
+                "The screen locks when it leaves Bluetooth range.",
+            )
+        elif event == "cancel":
+            log(f"{self.config['name']} is back; lock cancelled")
+            notify(f"{self.config['name']} is back", "Lock cancelled.")
+        elif event == "rearm":
+            log(f"{self.config['name']} is back in range")
+
+    def publish(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self.last_state_write < 2:
+            return
+        self.last_state_write = now
+        age = None if self.guard.last_seen is None else int(now - self.guard.last_seen)
+        write_state(
+            {
+                "name": self.config["name"],
+                "address": self.config["address"],
+                "phase": self.guard.phase,
+                "last_seen_age": age,
+                "rssi": self.rssi,
+                "healthy": self.guard.healthy,
+            }
+        )
+
+    def apply_pause(self) -> None:
+        held = pause_until() is not None
+        if held and not self.guard.paused:
+            self.guard.pause()
+            log("paused")
+            self.publish(force=True)
+        elif not held and self.guard.paused:
+            self.guard.resume()
+            log("resumed; waiting to see the device again")
+            self.publish(force=True)
+
+    def bounce(self) -> None:
+        self.last_bounce = time.monotonic()
+        stop_discovery(self.bus, self.adapter)
+
+        def restart() -> bool:
+            if start_discovery(self.bus, self.adapter):
+                self.discovering = True
+                self.guard.mark_healthy()
+            else:
+                self.guard.mark_unhealthy()
+            return False
+
+        GLib.timeout_add(500, restart)
+
+    def tick(self) -> bool:
+        now = time.monotonic()
+        self.apply_pause()
+        if not self.powered:
+            self.guard.mark_unhealthy()
+            if not self.unhealthy_notified:
+                self.unhealthy_notified = True
+                notify("Proximity lock is waiting", "Bluetooth is off, so the screen will not lock.")
+        elif not self.discovering and now - self.last_bounce >= 8:
+            self.bounce()
+        else:
+            if not self.guard.healthy and self.powered and self.discovering:
+                self.guard.mark_healthy()
+                self.unhealthy_notified = False
+            quiet = None if self.guard.last_seen is None else now - self.guard.last_seen
+            if self.guard.healthy and (quiet is None or quiet >= 12) and now - self.last_bounce >= 12:
+                self.bounce()
+        event = self.guard.tick(now)
+        if event == "warn":
+            if screen_locked():
+                self.guard.phase = "away"
+                self.guard.warn_at = None
+                log(f"{self.config['name']} is away and the screen is already locked")
+            else:
+                log(f"{self.config['name']} left range; locking soon")
+                notify(
+                    f"{self.config['name']} left range",
+                    f"Locking the screen in {self.config['warn_seconds']} seconds.",
+                    "critical",
+                )
+        elif event == "cancel":
+            notify(f"{self.config['name']} is back", "Lock cancelled.")
+        elif event == "lock":
+            log(f"locking; {self.config['name']} has been out of range")
+            notify(f"{self.config['name']} left range", "The screen is locking.")
+            lock_screen()
+        if (
+            self.guard.phase == "searching"
+            and not self.search_notified
+            and now - self.started > 90
+            and not self.guard.paused
+        ):
+            self.search_notified = True
+            notify(
+                f"Still waiting for {self.config['name']}",
+                "Bring it close. The screen will not lock until it has been seen.",
+            )
+        self.publish(force=event is not None)
+        return True
+
+    def run(self) -> int:
+        if not ensure_power(self.bus, self.adapter):
+            log("Bluetooth is off; waiting")
+        props = props_of_adapter(self.bus, self.adapter)
+        self.powered = bool(props.get("Powered", True)) if props else False
+        self.discovering = bool(props.get("Discovering", False)) if props else False
+        self.bus.add_signal_receiver(
+            self.on_properties,
+            signal_name="PropertiesChanged",
+            dbus_interface=PROPS,
+            bus_name=BLUEZ,
+            path_keyword="path",
+        )
+        if start_discovery(self.bus, self.adapter):
+            self.discovering = True
+        self.last_bounce = time.monotonic()
+        GLib.timeout_add_seconds(1, self.tick)
+        self.publish(force=True)
+        log(f"running for {self.config['name']} ({self.config['address']})")
+
+        def shutdown(*_args) -> bool:
+            stop_discovery(self.bus, self.adapter)
+            self.loop.quit()
+            return False
+
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, shutdown)
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, shutdown)
+        self.loop.run()
+        return 0
+
+
+def props_of_adapter(bus: dbus.SystemBus, adapter: str) -> dict | None:
+    try:
+        props = dbus.Interface(bus.get_object(BLUEZ, adapter), PROPS)
+        return props.GetAll(ADAPTER_IFACE)
+    except dbus.exceptions.DBusException:
+        return None
+
+
+def cmd_run() -> int:
+    config = load_config()
+    if config is None:
+        log("no device selected")
+        return 0
+    bus = system_bus()
+    deadline = time.monotonic() + 120
+    adapter = None
+    while adapter is None:
+        adapter = find_adapter(bus)
+        if adapter:
+            break
+        if time.monotonic() >= deadline:
+            log("Bluetooth adapter did not appear")
+            return 1
+        time.sleep(2)
+    watcher = Watcher(bus, adapter, config)
+    return watcher.run()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Lock the screen when a chosen iPhone or Apple Watch leaves Bluetooth range.",
+    )
+    sub = parser.add_subparsers(dest="command")
+    sub.add_parser("pick", help="scan and choose the device")
+    sub.add_parser("scan", help="print nearby Bluetooth devices")
+    sub.add_parser("status", help="show the selected device and watcher state")
+    sub.add_parser("on", help="start watching the selected device")
+    sub.add_parser("off", help="stop watching")
+    sub.add_parser("resume", help="resume after a pause")
+    sub.add_parser("forget", help="stop watching and remove the pairing")
+    sub.add_parser("run", help="run the watcher (used by the systemd service)")
+    sub.add_parser("self-test", help="check the lock decision logic")
+    pause = sub.add_parser("pause", help="do not lock until resumed, or for N minutes")
+    pause.add_argument("minutes", nargs="?", type=int)
+    return parser
+
+
+def main(argv: list[str]) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    command = args.command
+    if command is None:
+        return cmd_status() if CONFIG_PATH.exists() else parser.print_help() or 0
+    if command == "pick":
+        return cmd_pick()
+    if command == "scan":
+        return cmd_scan()
+    if command == "status":
+        return cmd_status()
+    if command == "pause":
+        if args.minutes is not None and args.minutes <= 0:
+            print("Minutes must be a positive number.")
+            return 1
+        return cmd_pause(args.minutes)
+    if command == "resume":
+        return cmd_resume()
+    if command == "on":
+        return cmd_on()
+    if command == "off":
+        return cmd_off()
+    if command == "forget":
+        return cmd_forget()
+    if command == "run":
+        return cmd_run()
+    if command == "self-test":
+        return self_test()
+    parser.print_help()
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

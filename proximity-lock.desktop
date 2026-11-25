@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Proximity lock
+Comment=Choose a phone or watch that locks the screen when it leaves
+Exec=sh -c 'exec "$HOME/.local/bin/proximity-lock" pick'
+Icon=preferences-system-bluetooth
+Terminal=false
+Type=Application
+Categories=Settings;Utility;
+StartupNotify=false
