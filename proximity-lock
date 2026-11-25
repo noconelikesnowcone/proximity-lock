@@ -191,6 +191,176 @@ def real_name(props: dict) -> str:
     return ""
 
 
+SETUP_ACTIONS = {0x01, 0x05, 0x06, 0x09, 0x0B}
+ACTION_CLASS = {
+    0x02: "Phone",
+    0x04: "Phone",
+    0x06: "Tablet",
+    0x08: "Speaker",
+    0x0A: "Computer",
+    0x0C: "Apple TV",
+    0x0E: "Watch",
+}
+
+
+def manufacturer_bytes(manufacturer: object) -> bytes:
+    if not isinstance(manufacturer, dict):
+        return b""
+    for key, value in manufacturer.items():
+        if int(key) == APPLE:
+            return bytes(int(byte) for byte in value)
+    return b""
+
+
+def continuity_hints(manufacturer: object) -> set[str]:
+    """Categories that can be read from an Apple low-energy advertisement."""
+    data = manufacturer_bytes(manufacturer)
+    hints: set[str] = set()
+    index = 0
+    while index + 1 < len(data):
+        kind = data[index]
+        length = data[index + 1]
+        value = data[index + 2 : index + 2 + length]
+        if kind == 0x07:
+            hints.add("Headphones")
+        elif kind in {0x09, 0x0A}:
+            hints.add("Speaker")
+        elif kind == 0x0B:
+            hints.add("Watch")
+        elif kind == 0x0C:
+            hints.add("Handoff")
+        elif kind == 0x10:
+            hints.add("Nearby")
+        elif kind == 0x12:
+            hints.add("Tracker")
+        elif kind == 0x05:
+            hints.add("AirDrop")
+        elif kind == 0x0F and len(value) >= 6 and value[1] in SETUP_ACTIONS:
+            label = ACTION_CLASS.get(value[5])
+            if label:
+                hints.add(label)
+        if length < 0:
+            break
+        index += 2 + length
+        if index > len(data) + 8:
+            break
+    return hints
+
+
+def icon_kind(icon: str) -> str:
+    icon = icon.lower()
+    if icon == "phone":
+        return "Phone"
+    if icon == "computer":
+        return "Computer"
+    if "headset" in icon or "headphone" in icon:
+        return "Headphones"
+    if icon == "multimedia-player":
+        return "Speaker"
+    if icon == "input-keyboard":
+        return "Keyboard"
+    if icon == "input-mouse":
+        return "Mouse"
+    if icon.startswith("camera"):
+        return "Camera"
+    if icon == "printer":
+        return "Printer"
+    return ""
+
+
+def class_kind(cod: int) -> str:
+    if not cod:
+        return ""
+    major = (cod >> 8) & 0x1F
+    minor = (cod >> 2) & 0x3F
+    if major == 0x01:
+        return "Computer"
+    if major == 0x02:
+        return "Phone"
+    if major == 0x04:
+        if minor in {0x01, 0x02, 0x06, 0x07}:
+            return "Headphones"
+        if minor in {0x05, 0x08, 0x0A, 0x0F}:
+            return "Speaker"
+        return "Audio"
+    if major == 0x05:
+        if minor & 0x10 and minor & 0x20:
+            return "Keyboard"
+        if minor & 0x10:
+            return "Keyboard"
+        if minor & 0x20:
+            return "Mouse"
+        return ""
+    if major == 0x06:
+        return "Camera"
+    if major == 0x07:
+        return "Watch" if minor == 0x01 else "Wearable"
+    return ""
+
+
+def appearance_kind(appearance: int) -> str:
+    if not appearance:
+        return ""
+    category = appearance >> 6
+    sub = appearance & 0x3F
+    if category == 1:
+        return "Phone"
+    if category == 2:
+        return "Computer"
+    if category == 3:
+        return "Watch"
+    if category == 8:
+        return "Tracker"
+    if category == 10:
+        return "Speaker"
+    if category == 15 and sub == 1:
+        return "Keyboard"
+    if category == 15 and sub == 2:
+        return "Mouse"
+    return ""
+
+
+def device_kind(device: dict) -> str:
+    """Best plain-language category available for this device."""
+    name = (device.get("name") or "").lower()
+    if "iphone" in name:
+        return "Phone"
+    if "ipad" in name or "tablet" in name:
+        return "Tablet"
+    if "watch" in name:
+        return "Watch"
+    if any(word in name for word in ("airpod", "headphone", "headset", "beats")):
+        return "Headphones"
+    if any(word in name for word in ("macbook", "imac", "mac mini", "mac studio")):
+        return "Computer"
+    if "homepod" in name or "apple tv" in name:
+        return "Speaker"
+
+    for guess in (
+        icon_kind(str(device.get("icon") or "")),
+        class_kind(int(device.get("klass") or 0)),
+        appearance_kind(int(device.get("appearance") or 0)),
+    ):
+        if guess:
+            return guess
+
+    hints = set(device.get("hints") or [])
+    for specific in ("Watch", "Headphones", "Tablet", "Phone", "Computer", "Speaker", "Apple TV"):
+        if specific in hints:
+            return specific
+    if "Nearby" in hints:
+        return "Phone or tablet"
+    if "Handoff" in hints:
+        return "Phone or computer"
+    if "Tracker" in hints:
+        return "Tracker"
+    if "AirDrop" in hints:
+        return "Phone or computer"
+    if "Apple" in (device.get("kinds") or []):
+        return "Apple device"
+    return ""
+
+
 def kind_label(name: str, kinds: list[str]) -> str:
     lowered = name.lower()
     if "watch" in lowered:
@@ -224,9 +394,19 @@ def looks_like_phone_or_watch(name: str) -> bool:
 
 def rank_device(device: dict) -> tuple:
     name = device.get("name") or ""
+    kind = device_kind(device)
     rssi = device.get("rssi")
+    phone_like = kind in {
+        "Phone",
+        "Phone or tablet",
+        "Phone or computer",
+        "Tablet",
+        "Watch",
+        "iPhone",
+        "iPad",
+    } or looks_like_phone_or_watch(name)
     return (
-        0 if looks_like_phone_or_watch(name) else 1,
+        0 if phone_like else 1,
         0 if name else 1,
         -(rssi if isinstance(rssi, int) else -999),
     )
@@ -236,15 +416,11 @@ def include_in_picker(device: dict) -> bool:
     if device.get("name"):
         return True
     rssi = device.get("rssi")
-    if not isinstance(rssi, int) or rssi < -68:
+    if not isinstance(rssi, int) or rssi < -78:
         return False
-    kinds = set(device.get("kinds") or [])
-    if not kinds:
-        return rssi >= -55
-    boring = {"Find My", "AirPods", "AirPlay", "AirDrop"}
-    if kinds <= boring:
-        return False
-    return True
+    if device_kind(device):
+        return True
+    return rssi >= -55
 
 
 class Guard:
@@ -358,6 +534,44 @@ def self_test() -> int:
     blind.mark_unhealthy()
     assert blind.tick(100) is None
     assert blind.phase == "searching"
+    phone = {
+        "name": "Ring of Gyges",
+        "rssi": -40,
+        "address": "AA:BB:CC:DD:EE:FF",
+        "kinds": [],
+        "hints": set(),
+        "icon": "phone",
+        "klass": 0,
+        "appearance": 0,
+    }
+    assert device_title(phone) == "Ring of Gyges"
+    assert device_detail(phone).startswith("Phone")
+    assert "AA:BB" not in device_detail(phone)
+    tablet = {
+        "name": "",
+        "rssi": -48,
+        "address": "11:22:33:44:55:66",
+        "kinds": ["Apple"],
+        "hints": {"Nearby"},
+        "icon": "",
+        "klass": 0,
+        "appearance": 0,
+    }
+    assert device_title(tablet) == "Phone or tablet"
+    assert "11:22" not in device_title(tablet)
+    assert "11:22" not in device_detail(tablet)
+    buds = {
+        "name": "",
+        "rssi": -52,
+        "address": "22:33:44:55:66:77",
+        "kinds": [],
+        "hints": {"Headphones"},
+        "icon": "",
+        "klass": 0,
+        "appearance": 0,
+    }
+    assert device_title(buds) == "Headphones"
+    assert device_kind({"name": "", "icon": "", "klass": 0x000204, "appearance": 0, "hints": set(), "kinds": []}) == "Phone"
     print("proximity-lock: self-test ok")
     return 0
 
@@ -426,28 +640,32 @@ def record_from_props(props: dict) -> dict | None:
     rssi_value = int(rssi) if rssi is not None and int(rssi) < 0 else None
     if rssi_value is None:
         return None
-    kinds = apple_kinds(props.get("ManufacturerData") or {})
+    manufacturer = props.get("ManufacturerData") or {}
     return {
         "address": str(props["Address"]).upper(),
         "name": real_name(props),
         "rssi": rssi_value,
-        "kinds": kinds,
+        "kinds": apple_kinds(manufacturer),
+        "hints": continuity_hints(manufacturer),
+        "icon": str(props.get("Icon") or ""),
+        "klass": int(props["Class"]) if "Class" in props else 0,
+        "appearance": int(props["Appearance"]) if "Appearance" in props else 0,
         "paired": bool(props.get("Paired")),
         "path": "",
     }
 
 
-def discovery_filter() -> dict:
+def discovery_filter(transport: str = "le") -> dict:
     return {
-        "Transport": dbus.String("le"),
+        "Transport": dbus.String(transport),
         "DuplicateData": dbus.Boolean(True),
     }
 
 
-def start_discovery(bus: dbus.SystemBus, adapter: str) -> bool:
+def start_discovery(bus: dbus.SystemBus, adapter: str, transport: str = "le") -> bool:
     iface = dbus.Interface(bus.get_object(BLUEZ, adapter), ADAPTER_IFACE)
     try:
-        iface.SetDiscoveryFilter(discovery_filter())
+        iface.SetDiscoveryFilter(discovery_filter(transport))
     except dbus.exceptions.DBusException as exc:
         if "InProgress" not in str(exc) and "Failed" not in str(exc):
             log(f"discovery filter: {exc}")
@@ -495,36 +713,64 @@ def parse_menu_choice(raw: str | None) -> tuple[str, str] | None:
     return raw.strip(), ""
 
 
-def device_row(device: dict) -> tuple[str, str]:
-    name = device.get("name") or ""
-    kind = kind_label(name, device.get("kinds") or [])
+def device_title(device: dict) -> str:
+    name = (device.get("name") or "").strip()
+    if name:
+        return name
+    return device_kind(device) or "Nearby device"
+
+
+def device_detail(device: dict) -> str:
     rssi = device.get("rssi")
-    rssi_text = f"{rssi} dBm" if isinstance(rssi, int) else "in range"
-    label = name or f"Unnamed {kind}"
-    return label, f"{distance_word(rssi)}, {rssi_text}, {device['address']}"
+    place = f"{distance_word(rssi)}, {rssi} dBm" if isinstance(rssi, int) else distance_word(rssi)
+    kind = device_kind(device)
+    if (device.get("name") or "").strip() and kind:
+        return f"{kind}, {place}"
+    return place
 
 
-def picker_rows(devices: list[dict]) -> list[tuple[str, str]]:
+def picker_rows(devices: list[dict]) -> tuple[list[tuple[str, str]], dict[tuple[str, str], dict]]:
     chosen = [device for device in devices if include_in_picker(device)]
-    chosen.sort(key=lambda device: -(device.get("rssi") if isinstance(device.get("rssi"), int) else -999))
+    chosen.sort(key=rank_device)
     rows: list[tuple[str, str]] = []
+    by_row: dict[tuple[str, str], dict] = {}
     seen: set[str] = set()
-    if len(chosen) >= 2 and isinstance(chosen[0].get("rssi"), int) and isinstance(chosen[1].get("rssi"), int):
-        gap = chosen[0]["rssi"] - chosen[1]["rssi"]
+
+    def add(label: str, detail: str, device: dict | None) -> None:
+        key = (label, detail)
+        copy = 2
+        while key in by_row or key in {(row[0], row[1]) for row in rows}:
+            key = (label, f"{detail} ({copy})" if detail else f"{label} ({copy})")
+            copy += 1
+        if device is not None:
+            by_row[key] = device
+        rows.append(key)
+
+    by_signal = sorted(
+        chosen,
+        key=lambda device: -(device.get("rssi") if isinstance(device.get("rssi"), int) else -999),
+    )
+    if by_signal and isinstance(by_signal[0].get("rssi"), int):
+        lead = by_signal[0]
+        others = [device.get("rssi") for device in by_signal[1:3] if isinstance(device.get("rssi"), int)]
+        gap = lead["rssi"] - max(others) if others else 99
         if gap >= 8:
-            rssi = chosen[0]["rssi"]
-            rows.append(("Against the computer", f"{rssi} dBm, {chosen[0]['address']}"))
-            seen.add(chosen[0]["address"])
-    named = [device for device in chosen if device.get("name")]
-    unnamed = [device for device in chosen if not device.get("name")]
-    for device in named + unnamed[:4]:
+            title = device_title(lead)
+            kind = device_kind(lead)
+            if (lead.get("name") or "").strip() and kind:
+                detail = f"{kind}, against the computer, {lead['rssi']} dBm"
+            else:
+                detail = f"Against the computer, {lead['rssi']} dBm"
+            add(title, detail, lead)
+            seen.add(lead["address"])
+    for device in chosen[:8]:
         if device["address"] in seen:
             continue
-        rows.append(device_row(device))
+        add(device_title(device), device_detail(device), device)
         seen.add(device["address"])
-    rows.append(("Scan again", "Hold the phone or watch against the computer"))
-    rows.append(("Cancel", ""))
-    return rows
+    add("Scan again", "Hold the phone or watch against the computer", None)
+    add("Cancel", "", None)
+    return rows, by_row
 
 
 def scan_and_ask(bus: dbus.SystemBus, adapter: str) -> tuple[str, str] | None:
@@ -553,12 +799,16 @@ def scan_and_ask(bus: dbus.SystemBus, adapter: str) -> tuple[str, str] | None:
             rssi = int(changed["RSSI"])
             if rssi < 0:
                 record["rssi"] = rssi
-        if "Name" in changed or "Alias" in changed:
+        if any(key in changed for key in ("Name", "Alias", "Icon", "Class", "Appearance")):
             props = props_of(bus, path)
             if props:
                 record["name"] = real_name(props)
+                record["icon"] = str(props.get("Icon") or "")
+                record["klass"] = int(props["Class"]) if "Class" in props else 0
+                record["appearance"] = int(props["Appearance"]) if "Appearance" in props else 0
         if "ManufacturerData" in changed:
             record["kinds"] = apple_kinds(changed["ManufacturerData"])
+            record["hints"] = continuity_hints(changed["ManufacturerData"])
         if "Paired" in changed:
             record["paired"] = bool(changed["Paired"])
 
@@ -581,7 +831,9 @@ def scan_and_ask(bus: dbus.SystemBus, adapter: str) -> tuple[str, str] | None:
         dbus_interface=OM,
         bus_name=BLUEZ,
     )
-    start_discovery(bus, adapter)
+    # "auto" includes a classic inquiry. That is where an iPhone sends its
+    # Bluetooth name. A low-energy scan only sees a rotating address.
+    start_discovery(bus, adapter, "auto")
     started = time.monotonic()
     decision: dict[str, tuple[str, str] | None] = {}
     loop = GLib.MainLoop()
@@ -604,20 +856,32 @@ def scan_and_ask(bus: dbus.SystemBus, adapter: str) -> tuple[str, str] | None:
         named = [device["name"] for device in devices if device.get("name")]
         log(f"picker saw {len(devices)} devices, {len(named)} named")
         for device in sorted(devices, key=rank_device)[:12]:
-            label = device["name"] or "(unnamed)"
+            label = device["name"] or device_kind(device) or "(unknown)"
             log(f"  {device['rssi']} dBm  {label}  {device['address']}  {', '.join(device['kinds'])}")
+
+        rows, by_row = picker_rows(devices)
 
         def ask() -> None:
             raw = menu(
-                "Hold the phone or watch against this computer, then choose it",
-                picker_rows(devices),
+                "Choose the phone or watch by its name",
+                rows,
                 width=640,
             )
             parsed = parse_menu_choice(raw)
-            if parsed is None:
-                decision["choice"] = ("Cancel", "cancel")
+            if parsed is None or parsed[0] in {"", "Cancel"}:
+                decision["choice"] = ("cancel", "", "")
+            elif parsed[0] == "Scan again":
+                decision["choice"] = ("rescan", "", "")
             else:
-                decision["choice"] = parsed
+                device = by_row.get(parsed)
+                if device is None:
+                    same_name = [item for (label, _detail), item in by_row.items() if label == parsed[0]]
+                    device = same_name[0] if len(same_name) == 1 else None
+                if device is None:
+                    log(f"menu choice did not match a device: {parsed}")
+                    decision["choice"] = ("cancel", "", "")
+                else:
+                    decision["choice"] = ("device", device["address"], device.get("name") or "")
             GLib.idle_add(loop.quit)
 
         threading.Thread(target=ask, daemon=True).start()
@@ -625,7 +889,9 @@ def scan_and_ask(bus: dbus.SystemBus, adapter: str) -> tuple[str, str] | None:
     def maybe_open() -> bool:
         elapsed = time.monotonic() - started
         named_target = any(
-            looks_like_phone_or_watch(device.get("name") or "") for device in by_path.values()
+            looks_like_phone_or_watch(device.get("name") or "")
+            or (device.get("paired") and device.get("name"))
+            for device in by_path.values()
         )
         if named_target and elapsed >= 8:
             open_menu()
@@ -653,7 +919,7 @@ def scan_and_ask(bus: dbus.SystemBus, adapter: str) -> tuple[str, str] | None:
         )
     choice = decision.get("choice")
     if choice is None:
-        return ("Cancel", "cancel")
+        return ("cancel", "", "")
     return choice
 
 
@@ -933,7 +1199,7 @@ def cmd_pick() -> int:
             return 1
         notify(
             "Hold it against this computer",
-            "Put the iPhone or Apple Watch on the computer. On the iPhone, leave Settings → Bluetooth open. Then choose the strongest signal.",
+            "On the iPhone, leave Settings → Bluetooth open so its name appears. Then choose that name.",
         )
         log("waiting for the device to be held against the computer")
         time.sleep(6)
@@ -941,19 +1207,16 @@ def cmd_pick() -> int:
             choice = scan_and_ask(bus, adapter)
             if choice is None:
                 return 1
-            label, subtext = choice
-            if label in {"", "Cancel"}:
+            action, address, name = choice
+            if action == "cancel":
                 log("picker cancelled")
                 return 1
-            if label == "Scan again":
-                notify("Scanning again", "Hold the phone or watch against the computer.")
+            if action == "rescan":
+                notify("Scanning again", "Leave Settings → Bluetooth open so the phone's name appears.")
                 continue
-            found = re.search(r"(?:[0-9A-F]{2}:){5}[0-9A-F]{2}", subtext.upper())
-            if not found:
+            if action != "device" or not MAC_RE.match(address):
                 log(f"unexpected menu result: {choice}")
                 return 1
-            address = found.group(0)
-            name = "" if label.startswith("Unnamed") or label == "Against the computer" else label
             identity = pair_device(bus, adapter, address, name)
             if not identity:
                 return 1
